@@ -159,7 +159,8 @@ private[spark] class Client(
    * Cleanup application staging directory.
    */
   private def cleanupStagingDir(appId: ApplicationId): Unit = {
-    val appStagingDir = getAppStagingDir(appId)
+    // val appStagingDir = getAppStagingDir(appId)
+    val appStagingDir = getAppStagingDir(sparkConf, appId)
     try {
       val preserveFiles = sparkConf.getBoolean("spark.yarn.preserve.staging.files", false)
       val stagingDirPath = new Path(appStagingDir)
@@ -716,7 +717,8 @@ private[spark] class Client(
     : ContainerLaunchContext = {
     logInfo("Setting up container launch context for our AM")
     val appId = newAppResponse.getApplicationId
-    val appStagingDir = getAppStagingDir(appId)
+    // val appStagingDir = getAppStagingDir(appId)
+    val appStagingDir = getAppStagingDir(sparkConf, appId)
     val pySparkArchives =
       if (sparkConf.getBoolean("spark.yarn.isPython", false)) {
         findPySparkArchives()
@@ -1089,7 +1091,9 @@ object Client extends Logging {
   val LOCAL_SCHEME = "local"
 
   // Staging directory for any temporary jars or files
-  val SPARK_STAGING: String = ".sparkStaging"
+  // val SPARK_STAGING: String = ".sparkStaging"
+  val CONF_STAGING_DIR = "spark.yarn.stagingDir"
+  val DEFAULT_STAGING_DIR: String = ".sparkStaging"
 
   // Location of any user-defined Spark jars
   val CONF_SPARK_JAR = "spark.yarn.jar"
@@ -1152,8 +1156,11 @@ object Client extends Logging {
   /**
    * Return the path to the given application's staging directory.
    */
-  private def getAppStagingDir(appId: ApplicationId): String = {
-    buildPath(SPARK_STAGING, appId.toString())
+  // private def getAppStagingDir(appId: ApplicationId): String = {
+  //  buildPath(SPARK_STAGING, appId.toString())
+  // }
+  private def getAppStagingDir(conf: SparkConf, appId: ApplicationId): String = {
+    buildPath(conf.get(CONF_STAGING_DIR, DEFAULT_STAGING_DIR), appId.toString())
   }
 
   /**
