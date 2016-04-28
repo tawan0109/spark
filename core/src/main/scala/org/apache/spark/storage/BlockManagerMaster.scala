@@ -17,14 +17,13 @@
 
 package org.apache.spark.storage
 
-import scala.collection.Iterable
+import scala.collection.{Iterable, mutable}
 import scala.collection.generic.CanBuildFrom
 import scala.concurrent.{Await, Future}
-
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.{Logging, SparkConf, SparkException}
 import org.apache.spark.storage.BlockManagerMessages._
-import org.apache.spark.util.{ThreadUtils, RpcUtils}
+import org.apache.spark.util.{RpcUtils, ThreadUtils}
 
 private[spark]
 class BlockManagerMaster(
@@ -39,6 +38,11 @@ class BlockManagerMaster(
   def removeExecutor(execId: String) {
     tell(RemoveExecutor(execId))
     logInfo("Removed " + execId + " successfully in removeExecutor")
+  }
+
+  def addExecutor(execId: String) {
+    tell(AddExecutor(execId))
+    logInfo("Added " + execId + " successfully in addExecutor")
   }
 
   /** Register the BlockManager's id with the driver. */

@@ -51,6 +51,8 @@ class BlockManagerMasterEndpoint(
   // Mapping from block id to the set of block managers that have the block.
   private val blockLocations = new JHashMap[BlockId, mutable.HashSet[BlockManagerId]]
 
+  private val recentlyLostExecutors = new mutable.HashSet[String]
+
   private val askThreadPool = ThreadUtils.newDaemonCachedThreadPool("block-manager-ask-thread-pool")
   private implicit val askExecutionContext = ExecutionContext.fromExecutorService(askThreadPool)
 
@@ -104,6 +106,10 @@ class BlockManagerMasterEndpoint(
 
     case RemoveExecutor(execId) =>
       removeExecutor(execId)
+      context.reply(true)
+
+    case AddExecutor(execId) =>
+      addExecutor(execId)
       context.reply(true)
 
     case StopBlockManagerMaster =>
@@ -199,7 +205,19 @@ class BlockManagerMasterEndpoint(
 
   private def removeExecutor(execId: String) {
     logInfo("Trying to remove executor " + execId + " from BlockManagerMaster.")
+
+    recentlyLostExecutors.add(execId)
+    logInfo("Add executor " + execId + " to recently lost executor list.")
+
     blockManagerIdByExecutor.get(execId).foreach(removeBlockManager)
+  }
+
+  private def addExecutor(execId: String) {
+    logInfo("Trying to add executor " + execId + " to BlockManagerMaster.")
+
+    if (recentlyLostExecutors.remove(execId)) {
+      logInfo(execId + " is just put into lost list.")
+    }
   }
 
   /**
@@ -300,24 +318,32 @@ class BlockManagerMasterEndpoint(
 
   private def register(id: BlockManagerId, maxMemSize: Long, slaveEndpoint: RpcEndpointRef) {
     val time = System.currentTimeMillis()
-    if (!blockManagerInfo.contains(id)) {
-      blockManagerIdByExecutor.get(id.executorId) match {
-        case Some(oldId) =>
-          // A block manager of the same executor already exists, so remove it (assumed dead)
-          logError("Got two different block manager registrations on same executor - "
+
+    // Make sure executor has already registered before register blockManager
+    if(!recentlyLostExecutors.contains(id.executorId)) {
+      logInfo("BlockManager %s associated executor is alive".format(id.hostPort))
+      if (!blockManagerInfo.contains(id)) {
+        blockManagerIdByExecutor.get(id.executorId) match {
+          case Some(oldId) =>
+            // A block manager of the same executor already exists, so remove it (assumed dead)
+            logError("Got two different block manager registrations on same executor - "
               + s" will replace old one $oldId with new one $id")
-          removeExecutor(id.executorId)
-        case None =>
+            removeExecutor(id.executorId)
+          case None =>
+        }
+        logInfo("Registering block manager %s with %s RAM, %s".format(
+          id.hostPort, Utils.bytesToString(maxMemSize), id))
+
+        blockManagerIdByExecutor(id.executorId) = id
+
+        blockManagerInfo(id) = new BlockManagerInfo(
+          id, System.currentTimeMillis(), maxMemSize, slaveEndpoint)
       }
-      logInfo("Registering block manager %s with %s RAM, %s".format(
-        id.hostPort, Utils.bytesToString(maxMemSize), id))
-
-      blockManagerIdByExecutor(id.executorId) = id
-
-      blockManagerInfo(id) = new BlockManagerInfo(
-        id, System.currentTimeMillis(), maxMemSize, slaveEndpoint)
+      listenerBus.post(SparkListenerBlockManagerAdded(time, id, maxMemSize))
+    } else {
+      logError("Try to add blockManager %s which associated executor is not alive".
+        format(id.hostPort))
     }
-    listenerBus.post(SparkListenerBlockManagerAdded(time, id, maxMemSize))
   }
 
   private def updateBlockInfo(

@@ -99,6 +99,8 @@ private[spark] object BlockManagerMessages {
 
   case class RemoveExecutor(execId: String) extends ToBlockManagerMaster
 
+  case class AddExecutor(execId: String) extends ToBlockManagerMaster
+
   case object StopBlockManagerMaster extends ToBlockManagerMaster
 
   case object GetMemoryStatus extends ToBlockManagerMaster

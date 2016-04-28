@@ -1347,6 +1347,7 @@ class DAGScheduler(
       logInfo("Host added was in lost list earlier: " + host)
       failedEpoch -= execId
     }
+    blockManagerMaster.addExecutor(execId)
     submitWaitingStages()
   }
 
