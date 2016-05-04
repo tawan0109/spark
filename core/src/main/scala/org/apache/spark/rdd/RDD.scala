@@ -1508,10 +1508,15 @@ abstract class RDD[T: ClassTag](
     // NOTE: we use a global lock here due to complexities downstream with ensuring
     // children RDD partitions point to the correct parent partitions. In the future
     // we should revisit this consideration.
-    if (context.checkpointDir.isEmpty) {
-      throw new SparkException("Checkpoint directory has not been set in the SparkContext")
-    } else if (checkpointData.isEmpty) {
-      checkpointData = Some(new ReliableRDDCheckpointData(this))
+    if (conf.getBoolean("spark.checkpoint.local", false)) {
+      localCheckpoint()
+      logInfo("Enabled local checkpoint.")
+    } else {
+      if (context.checkpointDir.isEmpty) {
+        throw new SparkException("Checkpoint directory has not been set in the SparkContext")
+      } else if (checkpointData.isEmpty) {
+        checkpointData = Some(new ReliableRDDCheckpointData(this))
+      }
     }
   }
 
