@@ -19,15 +19,15 @@ package org.apache.spark.storage
 
 import java.io._
 import java.nio.{ByteBuffer, MappedByteBuffer}
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
-import scala.collection.mutable.{ArrayBuffer, HashMap}
+import scala.collection.mutable.{ArrayBuffer, HashMap, ListBuffer}
 import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, ExecutionContextExecutorService, Future}
 import scala.util.Random
 import scala.util.control.NonFatal
-
 import sun.nio.ch.DirectBuffer
-
 import org.apache.spark._
 import org.apache.spark.executor.{DataReadMethod, ShuffleWriteMetrics}
 import org.apache.spark.io.CompressionCodec
@@ -79,6 +79,18 @@ private[spark] class BlockManager(
 
   private val futureExecutionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("block-manager-future", 128))
+
+  private val replicateInParallel = conf.getBoolean(
+    "spark.mobius.streaming.block.replicateInParallel.enabled", false)
+  logInfo("spark.mobius.streaming.block.replicateInParallel.enabled: " + replicateInParallel)
+
+  private val replicationExecutionContext: Option[ExecutionContextExecutorService] =
+    if (replicateInParallel) {
+      Some(ExecutionContext.fromExecutorService(
+        ThreadUtils.newDaemonCachedThreadPool("block-manager-replication", 12)))
+    } else {
+      None
+    }
 
   // Actual storage of where blocks are kept
   private var externalBlockStoreInitialized = false
@@ -985,6 +997,122 @@ private[spark] class BlockManager(
     }
   }
 
+  private def replicateInParallel(blockId: BlockId, data: ByteBuffer, level: StorageLevel): Unit = {
+    val numPeersToReplicateTo = level.replication - 1
+    if(numPeersToReplicateTo <= 1) {
+      replicate(blockId, data, level)
+      return
+    }
+
+    val maxReplicationFailures = conf.getInt("spark.storage.maxReplicationFailures", 1)
+    val peersForReplication = List.synchronized(new ArrayBuffer[BlockManagerId]())
+    val peersReplicatedTo = List.synchronized(new ArrayBuffer[BlockManagerId])
+    val peersFailedToReplicateTo = List.synchronized(new ArrayBuffer[BlockManagerId])
+    val tLevel = StorageLevel(
+      level.useDisk, level.useMemory, level.useOffHeap, level.deserialized, 1)
+    val startTime = System.currentTimeMillis
+    val random = new Random(blockId.hashCode)
+
+    val replicationFailed = new AtomicBoolean(false)
+
+    // Get cached list of peers
+    peersForReplication ++= getPeers(forceFetch = false)
+
+    // Get a random peer. Note that this selection of a peer is deterministic on the block id.
+    // So assuming the list of peers does not change and no replication failures,
+    // if there are multiple attempts in the same node to replicate the same block,
+    // the same set of peers will be selected.
+
+    // need to be synchronized
+    def getRandomPeer(): Option[BlockManagerId] = {
+      // If replication had failed, then force update the cached list of peers and remove the peers
+      // that have been already used
+      if (replicationFailed.get()) {
+        peersForReplication.clear()
+        peersForReplication ++= getPeers(forceFetch = true)
+        peersForReplication --= peersReplicatedTo
+        peersForReplication --= peersFailedToReplicateTo
+      }
+      if (!peersForReplication.isEmpty) {
+        Some(peersForReplication(random.nextInt(peersForReplication.size)))
+        replicationFailed.set(true)
+      } else {
+        None
+      }
+    }
+
+    // One by one choose a random peer and try uploading the block to it
+    // If replication fails (e.g., target peer is down), force the list of cached peers
+    // to be re-fetched from driver and then pick another random peer for replication. Also
+    // temporarily black list the peer for which replication failed.
+    //
+    // This selection of a peer and replication is continued in a loop until one of the
+    // following 3 conditions is fulfilled:
+    // (i) specified number of peers have been replicated to
+    // (ii) too many failures in replicating to peers
+    // (iii) no peer left to replicate to
+    //
+
+    val failedCounter = new AtomicInteger(0)
+    val succeedCounter = new AtomicInteger(0)
+    val runningReplication = new AtomicInteger(0)
+
+    implicit def runnable(f: () => Unit): Runnable = new Runnable() { def run() = f() }
+
+    while (failedCounter.get < maxReplicationFailures &&
+      succeedCounter.get < numPeersToReplicateTo ) {
+
+      if (runningReplication.get() == numPeersToReplicateTo) {
+        Thread.sleep(500) // make it configurable
+      } else {
+        getRandomPeer() match {
+          case Some(peer) =>
+            runningReplication.incrementAndGet()
+            replicationExecutionContext.get.execute(runnable(() => {
+              try {
+                val onePeerStartTime = System.currentTimeMillis
+                logTrace(s"Trying to replicate $blockId of ${data.limit()} bytes to $peer")
+                blockTransferService.uploadBlockSync(
+                  peer.host, peer.port, peer.executorId, blockId,
+                  new NioManagedBuffer(data.duplicate()), tLevel)
+                logTrace(s"Replicated $blockId of ${data.limit()} bytes to $peer in %s ms"
+                  .format(System.currentTimeMillis - onePeerStartTime))
+
+                // need to be synchronized
+                peersReplicatedTo += peer
+                peersForReplication -= peer
+
+                succeedCounter.incrementAndGet()
+              } catch {
+                case e: Exception =>
+                  failedCounter.incrementAndGet()
+                  logWarning(s"Failed to replicate $blockId to $peer, failure #"
+                    + failedCounter.get(), e)
+
+                  replicationFailed.compareAndSet(true, false)
+
+                  // need to be synchronized
+                  peersFailedToReplicateTo += peer
+              } finally {
+                runningReplication.decrementAndGet()
+              }
+            }
+            ))
+          case None => // no peer left to replicate to
+            // done = true
+            failedCounter.set(numPeersToReplicateTo)
+        }
+      }
+    }
+    val timeTakeMs = (System.currentTimeMillis - startTime)
+    logDebug(s"Replicating $blockId of ${data.limit()} bytes to " +
+      s"${peersReplicatedTo.size} peer(s) took $timeTakeMs ms")
+    if (peersReplicatedTo.size < numPeersToReplicateTo) {
+      logWarning(s"Block $blockId replicated to only " +
+        s"${peersReplicatedTo.size} peer(s) instead of $numPeersToReplicateTo peers")
+    }
+  }
+
   /**
    * Read a block consisting of a single object.
    */
@@ -1080,6 +1208,7 @@ private[spark] class BlockManager(
 
   /**
    * Remove all blocks belonging to the given RDD.
+   *
    * @return The number of blocks removed.
    */
   def removeRdd(rddId: Int): Int = {
