@@ -1045,7 +1045,6 @@ private[spark] class BlockManager(
         peersForReplication --= peersFailedToReplicateTo
       }
       if (!peersForReplication.isEmpty) {
-        replicationFailed.set(true)
         Some(peersForReplication(random.nextInt(peersForReplication.size)))
       } else {
         None
@@ -1092,7 +1091,7 @@ private[spark] class BlockManager(
                 failedCounter.incrementAndGet()
                 logWarning(s"Failed to replicate $blockId to $peer, failure #"
                   + failedCounter.get(), e)
-                replicationFailed.compareAndSet(true, false)
+                replicationFailed.compareAndSet(false, true)
                 // need to be synchronized
                 peersFailedToReplicateTo += peer
 
