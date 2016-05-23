@@ -1057,7 +1057,14 @@ private[spark] class BlockManager(
 
     val succeededCounter = new AtomicInteger(numPeersToReplicateTo)
     val failedCounter = new AtomicInteger()
-    val countDownLatch = new CountDownLatch(numPeersToReplicateTo)
+    var minReplicas = conf.getInt("spark.mobius.streaming.block.replication.min",
+      numPeersToReplicateTo)
+    if (minReplicas > numPeersToReplicateTo) {
+      minReplicas = numPeersToReplicateTo
+      logWarning(s"[spark.mobius.streaming.block.replication.min] is set to $minReplicas, " +
+        s"which is greater than numPeersToReplicateTo: $numPeersToReplicateTo")
+    }
+    val countDownLatch = new CountDownLatch(minReplicas)
 
     implicit def runnable(f: () => Unit): Runnable = new Runnable() { def run() = f() }
 
@@ -1108,9 +1115,9 @@ private[spark] class BlockManager(
     val timeTakeMs = (System.currentTimeMillis - startTime)
     logDebug(s"Replicating $blockId of ${data.limit()} bytes to " +
       s"${peersReplicatedTo.size} peer(s) took $timeTakeMs ms")
-    if (peersReplicatedTo.size < numPeersToReplicateTo) {
+    if (peersReplicatedTo.size < minReplicas) {
       logWarning(s"Block $blockId replicated to only " +
-        s"${peersReplicatedTo.size} peer(s) instead of $numPeersToReplicateTo peers")
+        s"${peersReplicatedTo.size} peer(s) instead of $minReplicas peers")
     }
   }
 
