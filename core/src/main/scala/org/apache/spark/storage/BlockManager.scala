@@ -943,7 +943,8 @@ private[spark] class BlockManager(
       // that have been already used
       if (replicationFailed) {
         peersForReplication.clear()
-        peersForReplication ++= getPeers(forceFetch = true)
+        peersForReplication ++= getPeers(forceFetch = true).
+          filter(p => p.host !=  blockManagerId.host)
         peersForReplication --= peersReplicatedTo
         peersForReplication --= peersFailedToReplicateTo
       }
@@ -1038,7 +1039,8 @@ private[spark] class BlockManager(
       // that have been already used
       if (replicationFailed.get()) {
         peersForReplication.clear()
-        peersForReplication ++= getPeers(forceFetch = true)
+        peersForReplication ++= getPeers(forceFetch = true).
+          filter(p => p.host !=  blockManagerId.host)
         peersForReplication --= peersReplicatedTo
         peersForReplication --= peersFailedToReplicateTo
       }
