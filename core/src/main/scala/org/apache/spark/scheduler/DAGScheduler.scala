@@ -1185,7 +1185,7 @@ class DAGScheduler(
               shuffleStage.addOutputLoc(smt.partitionId, status)
             }
 
-            if (runningStages.contains(shuffleStage) && shuffleStage.pendingPartitions.isEmpty) {
+            if (runningStages.contains(shuffleStage) && shuffleStage.isAvailable) {
               markStageAsFinished(shuffleStage)
               logInfo("looking for newly runnable stages")
               logInfo("running: " + runningStages)
