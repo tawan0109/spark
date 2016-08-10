@@ -370,7 +370,13 @@ class JobProgressListener(conf: SparkConf) extends SparkListener with Logging {
         case _ =>
           execSummary.failedTasks += 1
       }
-      execSummary.taskTime += info.duration
+      if(info.finished) {
+        execSummary.taskTime += info.duration
+      } else {
+        logWarning("Detected unfinished SparkListenerTaskEnd event, reason: " + taskEnd.reason +
+          ", stageId: " + taskEnd.stageId + ", stageAttempId: " + taskEnd.stageAttemptId
+          + ", taskId" + info.taskId)
+      }
       stageData.numActiveTasks -= 1
 
       val (errorMessage, metrics): (Option[String], Option[TaskMetrics]) =
