@@ -19,7 +19,8 @@ package org.apache.spark.storage
 
 import java.io._
 import java.nio.{ByteBuffer, MappedByteBuffer}
-import java.util.concurrent.{TimeUnit, CountDownLatch}
+import java.util
+import java.util.concurrent.{TimeUnit, _}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.collection.mutable.{ArrayBuffer, HashMap, ListBuffer}
@@ -80,6 +81,8 @@ private[spark] class BlockManager(
   private val futureExecutionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("block-manager-future", 128))
 
+  private val blocksInReplicating = new ConcurrentHashMap[]()
+
   private val replicateInParallel = conf.getBoolean(
     "spark.mobius.streaming.block.replicateInParallel.enabled", false)
   logInfo("spark.mobius.streaming.block.replicateInParallel.enabled: " + replicateInParallel)
@@ -91,6 +94,20 @@ private[spark] class BlockManager(
     } else {
       None
     }
+
+  private val waitingForReplicationBlocks = new LinkedBlockingQueue[(BlockId, ByteBuffer, StorageLevel)]()
+
+  ThreadUtils.newDaemonSingleThreadExecutor("BlockReplicator").execute(new Runnable {
+    def run(): Unit = {
+      logInfo("Ready to replicate blocks to remote.")
+      while(!Thread.currentThread().isInterrupted) {
+        val (blockId, byteBuffer, storageLevel) = waitingForReplicationBlocks.take()
+        if (!Thread.currentThread().isInterrupted) {
+          replicate(blockId, byteBuffer, storageLevel)
+        }
+      }
+    }
+  })
 
   // Actual storage of where blocks are kept
   private var externalBlockStoreInitialized = false
@@ -1014,112 +1031,14 @@ private[spark] class BlockManager(
     }
 
     logInfo(s"Replicate blocks to $numPeersToReplicateTo peers in parallel.")
-    val maxReplicationFailures = conf.getInt("spark.storage.maxReplicationFailures", 1)
-    val peersForReplication = List.synchronized(new ArrayBuffer[BlockManagerId]())
-    val peersReplicatedTo = List.synchronized(new ArrayBuffer[BlockManagerId])
-    val peersFailedToReplicateTo = List.synchronized(new ArrayBuffer[BlockManagerId])
-    val tLevel = StorageLevel(
-      level.useDisk, level.useMemory, level.useOffHeap, level.deserialized, 1)
-    val startTime = System.currentTimeMillis
-    val random = new Random(blockId.hashCode)
-
-    val replicationFailed = new AtomicBoolean(false)
-
-    // Get cached list of peers
-    peersForReplication ++= getPeers(forceFetch = false)
-
-    // Get a random peer. Note that this selection of a peer is deterministic on the block id.
-    // So assuming the list of peers does not change and no replication failures,
-    // if there are multiple attempts in the same node to replicate the same block,
-    // the same set of peers will be selected.
-
-    // need to be synchronized
-    def getRandomPeer(): Option[BlockManagerId] = {
-      // If replication had failed, then force update the cached list of peers and remove the peers
-      // that have been already used
-      if (replicationFailed.get()) {
-        peersForReplication.clear()
-        peersForReplication ++= getPeers(forceFetch = true).
-          filter(p => p.host !=  blockManagerId.host)
-        peersForReplication --= peersReplicatedTo
-        peersForReplication --= peersFailedToReplicateTo
-      }
-      if (!peersForReplication.isEmpty) {
-        Some(peersForReplication(random.nextInt(peersForReplication.size)))
-      } else {
-        None
-      }
-    }
-
-    // One by one choose a random peer and try uploading the block to it
-    // If replication fails (e.g., target peer is down), force the list of cached peers
-    // to be re-fetched from driver and then pick another random peer for replication. Also
-    // temporarily black list the peer for which replication failed.
-
-    val succeededCounter = new AtomicInteger(numPeersToReplicateTo)
-    val failedCounter = new AtomicInteger()
-    var minReplicas = conf.getInt("spark.mobius.streaming.block.replication.min",
-      numPeersToReplicateTo)
-    if (minReplicas > numPeersToReplicateTo) {
-      minReplicas = numPeersToReplicateTo
-      logWarning(s"[spark.mobius.streaming.block.replication.min] is set to $minReplicas, " +
-        s"which is greater than numPeersToReplicateTo: $numPeersToReplicateTo")
-    }
-    val countDownLatch = new CountDownLatch(minReplicas)
-
-    implicit def runnable(f: () => Unit): Runnable = new Runnable() { def run() = f() }
+    val waitingBlocks = waitingForReplicationBlocks.drainTo(new util.ArrayList[(BlockId, ByteBuffer, StorageLevel)])
+    logInfo("There are still " + waitingBlocks + " blocks waiting for replication.")
 
     for (i <- 1 to numPeersToReplicateTo) {
-      getRandomPeer() match {
-        case Some(peer) =>
-          replicationExecutionContext.get.execute(runnable(() => {
-            try {
-              val onePeerStartTime = System.currentTimeMillis
-              logTrace(s"Trying to replicate $blockId of ${data.limit()} bytes to $peer")
-              blockTransferService.uploadBlockSync(
-                peer.host, peer.port, peer.executorId, blockId,
-                new NioManagedBuffer(data.duplicate()), tLevel)
-              logTrace(s"Replicated $blockId of ${data.limit()} bytes to $peer in %s ms"
-                .format(System.currentTimeMillis - onePeerStartTime))
-
-              // need to be synchronized
-              peersReplicatedTo += peer
-              peersForReplication -= peer
-              succeededCounter.incrementAndGet()
-            } catch {
-              case e: Exception =>
-                failedCounter.incrementAndGet()
-                logWarning(s"Failed to replicate $blockId to $peer, failure #"
-                  + failedCounter.get(), e)
-                replicationFailed.compareAndSet(false, true)
-                // need to be synchronized
-                peersFailedToReplicateTo += peer
-
-                if (failedCounter.get() > maxReplicationFailures) {
-                  val leftCount = countDownLatch.getCount.toInt
-                  for (n <- 1 to leftCount) {
-                   countDownLatch.countDown()
-                  }
-                }
-            }
-          }
-          ))
-        case None => // no peer left to replicate to
-          // done = true
-          failedCounter.set(numPeersToReplicateTo)
-      }
+      waitingForReplicationBlocks.add((blockId, data, level))
     }
 
-  countDownLatch.await(conf.getLong("spark.mobius.streaming.block.replication.timeout", 10),
-      TimeUnit.SECONDS)
-
-    val timeTakeMs = (System.currentTimeMillis - startTime)
-    logDebug(s"Replicating $blockId of ${data.limit()} bytes to " +
-      s"${peersReplicatedTo.size} peer(s) took $timeTakeMs ms")
-    if (peersReplicatedTo.size < minReplicas) {
-      logWarning(s"Block $blockId replicated to only " +
-        s"${peersReplicatedTo.size} peer(s) instead of $minReplicas peers")
-    }
+    logInfo(s"Put $numPeersToReplicateTo replication operations to queue.")
   }
 
   /**
